@@ -1,0 +1,472 @@
+package com.example.ui.screens
+
+import android.os.Environment
+import android.widget.Toast
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.example.data.AppUpdateModel
+import com.example.data.UpdateRepository
+import com.example.data.VersionConfig
+import kotlinx.coroutines.launch
+import java.io.File
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun UpdateScreen(navController: androidx.navigation.NavController) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val updateRepository = remember { UpdateRepository() }
+
+    // RUTA DE TU REPOSITORIO
+    val GITHUB_REPO = "menajohan90-cell/Mi-app-de-tiktok2.0"
+
+    var isLoading by remember { mutableStateOf(true) }
+    var isChecking by remember { mutableStateOf(false) }
+    var checkError by remember { mutableStateOf<String?>(null) }
+    var latestUpdate by remember { mutableStateOf<AppUpdateModel?>(null) }
+    val localVersionName = remember { updateRepository.getInstalledVersionName(context) }
+    val localVersionCode = remember { updateRepository.getInstalledVersionCode(context) }
+
+    var isDownloading by remember { mutableStateOf(false) }
+    var downloadProgress by remember { mutableStateOf(0f) }
+    var downloadedBytesText by remember { mutableStateOf("") }
+    var downloadComplete by remember { mutableStateOf(false) }
+
+    // GitHub Sync State
+    var githubApkUrl by remember { mutableStateOf<String?>(null) }
+    var githubVersionConfig by remember { mutableStateOf<VersionConfig?>(null) }
+    var isCheckingGithub by remember { mutableStateOf(false) }
+    
+    // Status message for the user
+    var statusMessage by remember { mutableStateOf("Buscando actualizaciones...") }
+    
+    // Patch State
+    var isApplyingPatch by remember { mutableStateOf(false) }
+    var patchProgress by remember { mutableStateOf(0f) }
+    
+    // Dialog State
+    var showUpdateConfirmDialog by remember { mutableStateOf(false) }
+    var selectedApkUrl by remember { mutableStateOf("") }
+    
+    var showManualUrlInput by remember { mutableStateOf(false) }
+    var manualUrl by remember { mutableStateOf("") }
+
+    fun startDownload(urlToUse: String) {
+        if (urlToUse.isBlank()) {
+            Toast.makeText(context, "URL no válida", Toast.LENGTH_SHORT).show()
+            return
+        }
+        isDownloading = true
+        downloadComplete = false
+        scope.launch {
+            val result = updateRepository.downloadAndInstallApk(
+                context = context,
+                apkUrl = urlToUse,
+                onProgress = { progress, downloaded, total ->
+                    downloadProgress = progress
+                    val downloadedMb = String.format("%.1f MB", downloaded / (1024.0 * 1024.0))
+                    val totalMb = String.format("%.1f MB", total / (1024.0 * 1024.0))
+                    downloadedBytesText = "$downloadedMb / $totalMb"
+                }
+            )
+            isDownloading = false
+            result.onSuccess {
+                downloadComplete = true
+                Toast.makeText(context, "Descarga completada.", Toast.LENGTH_SHORT).show()
+            }.onFailure { e ->
+                Toast.makeText(context, "Error: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    fun fetchUpdates() {
+        scope.launch {
+            isChecking = true
+            checkError = null
+            statusMessage = "Conectando con GitHub..."
+            
+            // Check Firebase
+            updateRepository.getLatestUpdate().onSuccess { update ->
+                latestUpdate = update
+            }
+
+            // Check GitHub version.json (Hot Update source)
+            isCheckingGithub = true
+            val githubResult = updateRepository.getGitHubVersionConfig(GITHUB_REPO)
+            githubResult.onSuccess { config ->
+                githubVersionConfig = config
+                githubApkUrl = config.apkUrl
+                if (config.versionCode > localVersionCode) {
+                    statusMessage = "¡Nueva versión disponible en GitHub!"
+                } else {
+                    statusMessage = "Estás al día con GitHub."
+                }
+            }.onFailure { e ->
+                android.util.Log.w("UpdateScreen", "version.json no encontrado: ${e.message}")
+                // Fallback to older release method if version.json not found
+                updateRepository.getGitHubLatestRelease(GITHUB_REPO).onSuccess { url ->
+                    githubApkUrl = url
+                    statusMessage = "APK encontrado en GitHub (Releases)"
+                }.onFailure {
+                    statusMessage = "No se pudo sincronizar con GitHub"
+                }
+            }
+            
+            isCheckingGithub = false
+            isChecking = false
+            isLoading = false
+        }
+    }
+
+    fun applyPatch(url: String) {
+        isApplyingPatch = true
+        scope.launch {
+            val result = updateRepository.downloadAndApplyPatch(context, url) { progress ->
+                patchProgress = progress
+            }
+            isApplyingPatch = false
+            result.onSuccess {
+                Toast.makeText(context, "¡Parche aplicado con éxito!", Toast.LENGTH_LONG).show()
+                fetchUpdates()
+            }.onFailure {
+                Toast.makeText(context, "Error al aplicar parche: ${it.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        fetchUpdates()
+    }
+
+    // Comparison logic: 
+    // An update is found if:
+    // 1. GitHub version.json reports a higher versionCode
+    // 2. Firebase reports a higher versionCode
+    // 3. (Fallback) If version.json is missing but githubApkUrl was found, we show it but don't force it as "update" unless we have no other info.
+    val hasGithubUpdate = githubVersionConfig != null && githubVersionConfig!!.versionCode > localVersionCode
+    val remoteCode = latestUpdate?.versionCode ?: 0
+    val hasFirebaseUpdate = latestUpdate != null && remoteCode > localVersionCode
+    val hasPatch = githubVersionConfig?.patchUrl?.isNotBlank() == true && githubVersionConfig!!.versionCode > localVersionCode
+    
+    val anyUpdateFound = hasGithubUpdate || hasFirebaseUpdate || hasPatch
+    
+    val scrollState = rememberScrollState()
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { 
+                    Text("Centro de Instalación", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp) 
+                },
+                navigationIcon = {
+                    IconButton(onClick = { navController.popBackStack() }) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Volver", tint = Color.White)
+                    }
+                },
+                actions = {
+                    val authUser = com.google.firebase.auth.FirebaseAuth.getInstance().currentUser
+                    if (authUser?.displayName?.lowercase()?.contains("menajohan90") == true || authUser?.email?.contains("menajohan90") == true) {
+                        IconButton(onClick = { navController.navigate("admin_panel") }) {
+                            Icon(Icons.Default.AdminPanelSettings, contentDescription = "Panel Admin", tint = Color(0xFFF59E0B))
+                        }
+                    }
+                    IconButton(onClick = { fetchUpdates() }) {
+                        Icon(if (isChecking) Icons.Default.Sync else Icons.Default.Refresh, contentDescription = "Sincronizar", tint = Color(0xFF22C55E))
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Black)
+            )
+        },
+        containerColor = Color.Black
+    ) { padding ->
+        Box(modifier = Modifier.padding(padding).fillMaxSize()) {
+            if (isLoading) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator(color = Color(0xFF22C55E))
+                }
+            } else {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .verticalScroll(scrollState)
+                        .padding(16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    // --- CABECERA DE ESTADO ---
+                    Spacer(modifier = Modifier.height(20.dp))
+                    
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        TextButton(onClick = { showManualUrlInput = !showManualUrlInput }) {
+                            Text(if (showManualUrlInput) "Cerrar experto" else "Modo Experto", color = Color.Gray, fontSize = 11.sp)
+                        }
+                    }
+
+                    if (showManualUrlInput) {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 24.dp)
+                        ) {
+                            Column(modifier = Modifier.padding(16.dp)) {
+                                Text("Instalación Manual (Solo desarrolladores)", color = Color.White, fontWeight = FontWeight.Bold)
+                                Spacer(modifier = Modifier.height(8.dp))
+                                OutlinedTextField(
+                                    value = manualUrl,
+                                    onValueChange = { manualUrl = it },
+                                    placeholder = { Text("Pega URL del APK aquí") },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White)
+                                )
+                                Spacer(modifier = Modifier.height(12.dp))
+                                Button(
+                                    onClick = { startDownload(manualUrl) },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    enabled = manualUrl.isNotBlank() && !isDownloading
+                                ) {
+                                    Text("FORZAR DESCARGA E INSTALACIÓN")
+                                }
+                            }
+                        }
+                    }
+                    
+                    Box(
+                        modifier = Modifier
+                            .size(100.dp)
+                            .clip(CircleShape)
+                            .background(if (anyUpdateFound) Color(0xFF22C55E).copy(alpha = 0.1f) else Color(0xFF3F3F46).copy(alpha = 0.1f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = if (anyUpdateFound) Icons.Default.SystemUpdate else Icons.Default.CheckCircle,
+                            contentDescription = null,
+                            tint = if (anyUpdateFound) Color(0xFF22C55E) else Color.Gray,
+                            modifier = Modifier.size(50.dp)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(24.dp))
+
+                    Text(
+                        text = if (anyUpdateFound) "¡Actualización Encontrada!" else "Estado del Sistema",
+                        color = Color.White,
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center
+                    )
+                    
+                    Spacer(modifier = Modifier.height(8.dp))
+                    
+                    Text(
+                        text = statusMessage,
+                        color = if (anyUpdateFound) Color(0xFF22C55E) else Color.Gray,
+                        fontSize = 14.sp,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 24.dp)
+                    )
+
+                    Spacer(modifier = Modifier.height(40.dp))
+
+                    // --- ACCIONES SI HAY ACTUALIZACIÓN ---
+                    if (anyUpdateFound) {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFF18181B)),
+                            shape = RoundedCornerShape(24.dp),
+                            modifier = Modifier.fillMaxWidth().border(1.dp, Color(0xFF27272A), RoundedCornerShape(24.dp))
+                        ) {
+                            Column(modifier = Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Default.Info, contentDescription = null, tint = Color(0xFF22C55E), modifier = Modifier.size(20.dp))
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text("Información de la entrega", color = Color.White, fontWeight = FontWeight.SemiBold)
+                                }
+                                
+                                Spacer(modifier = Modifier.height(16.dp))
+                                
+                                if (hasGithubUpdate) {
+                                    UpdateItemRow("Fuente", "GitHub (Auto-Sync)")
+                                    UpdateItemRow("Estado", "Lista para instalar")
+                                } else {
+                                    UpdateItemRow("Versión", latestUpdate?.versionName ?: "Nueva")
+                                    UpdateItemRow("Tipo", latestUpdate?.updateType ?: "Oficial")
+                                }
+                                
+                                Spacer(modifier = Modifier.height(24.dp))
+
+                                if (hasPatch && !isDownloading) {
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    Button(
+                                        onClick = { applyPatch(githubVersionConfig!!.patchUrl!!) },
+                                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3B82F6)),
+                                        modifier = Modifier.fillMaxWidth().height(48.dp),
+                                        shape = RoundedCornerShape(12.dp),
+                                        enabled = !isApplyingPatch
+                                    ) {
+                                        if (isApplyingPatch) {
+                                            CircularProgressIndicator(color = Color.White, modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                                            Spacer(modifier = Modifier.width(12.dp))
+                                            Text("Aplicando: ${(patchProgress * 100).toInt()}%")
+                                        } else {
+                                            Icon(Icons.Default.AutoFixHigh, contentDescription = null)
+                                            Spacer(modifier = Modifier.width(10.dp))
+                                            Text("APLICAR PARCHE RÁPIDO", fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                }
+
+                                if (isDownloading) {
+                                    DownloadProgressView(downloadProgress, downloadedBytesText)
+                                } else if (downloadComplete) {
+                                    Button(
+                                        onClick = {
+                                            val downloadsDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir
+                                            val apkFile = File(downloadsDir, "update_latest.apk")
+                                            updateRepository.installApk(context, apkFile)
+                                        },
+                                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF22C55E)),
+                                        modifier = Modifier.fillMaxWidth().height(56.dp),
+                                        shape = RoundedCornerShape(16.dp)
+                                    ) {
+                                        Icon(Icons.Default.InstallMobile, contentDescription = null)
+                                        Spacer(modifier = Modifier.width(10.dp))
+                                        Text("INSTALAR AHORA", fontWeight = FontWeight.Black, fontSize = 16.sp)
+                                    }
+                                } else {
+                                    Button(
+                                        onClick = { 
+                                            selectedApkUrl = githubApkUrl ?: latestUpdate?.apkUrl ?: ""
+                                            showUpdateConfirmDialog = true
+                                        },
+                                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF22C55E)),
+                                        modifier = Modifier.fillMaxWidth().height(56.dp),
+                                        shape = RoundedCornerShape(16.dp)
+                                    ) {
+                                        Icon(Icons.Default.Download, contentDescription = null)
+                                        Spacer(modifier = Modifier.width(10.dp))
+                                        Text("ACTUALIZAR E INSTALAR", fontWeight = FontWeight.Black, fontSize = 16.sp)
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // --- BOTÓN DE REINTENTAR SI NO HAY NADA ---
+                        OutlinedButton(
+                            onClick = { fetchUpdates() },
+                            modifier = Modifier.fillMaxWidth().height(54.dp),
+                            shape = RoundedCornerShape(16.dp),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF27272A)),
+                            enabled = !isChecking
+                        ) {
+                            if (isChecking) {
+                                CircularProgressIndicator(color = Color.White, modifier = Modifier.size(20.dp))
+                            } else {
+                                Icon(Icons.Default.Refresh, contentDescription = null, tint = Color.White)
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Text("Comprobar de nuevo", color = Color.White)
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(32.dp))
+
+                    // --- PIE DE PÁGINA ---
+                    Text(
+                        text = "Versión actual: v$localVersionName (código $localVersionCode)",
+                        color = Color.DarkGray,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+        }
+
+        // DIÁLOGO DE CONFIRMACIÓN
+        if (showUpdateConfirmDialog) {
+            AlertDialog(
+                onDismissRequest = { showUpdateConfirmDialog = false },
+                title = { 
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.SystemUpdate, contentDescription = null, tint = Color(0xFF22C55E))
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text("Confirmar Instalación", color = Color.White)
+                    }
+                },
+                text = {
+                    Text(
+                        "Se procederá a descargar e instalar el nuevo parche de seguridad o actualización. ¿Deseas continuar?",
+                        color = Color.LightGray
+                    )
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            showUpdateConfirmDialog = false
+                            startDownload(selectedApkUrl)
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF22C55E))
+                    ) {
+                        Text("Actualizar Ahora")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showUpdateConfirmDialog = false }) {
+                        Text("Cancelar", color = Color.Gray)
+                    }
+                },
+                containerColor = Color(0xFF18181B),
+                titleContentColor = Color.White,
+                textContentColor = Color.White
+            )
+        }
+    }
+}
+
+@Composable
+fun UpdateItemRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(text = label, color = Color.Gray, fontSize = 14.sp)
+        Text(text = value, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+    }
+}
+
+@Composable
+fun DownloadProgressView(progress: Float, text: String) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        LinearProgressIndicator(
+            progress = { progress },
+            color = Color(0xFF22C55E),
+            trackColor = Color(0xFF27272A),
+            modifier = Modifier.fillMaxWidth().height(12.dp).clip(CircleShape)
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text("${(progress * 100).toInt()}% descargando...", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+            Text(text, color = Color.Gray, fontSize = 12.sp)
+        }
+    }
+}
